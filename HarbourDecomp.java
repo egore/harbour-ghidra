@@ -27,6 +27,7 @@
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.data.ArrayDataType;
+import ghidra.program.model.data.ByteDataType;
 import ghidra.program.model.data.CharDataType;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypeManager;
@@ -61,14 +62,12 @@ public class HarbourDecomp extends GhidraScript {
             if (enumLabel != null) {
                 println("Byte at %s: 0x%02X (%d) => HB_PCODE.%s".formatted(addr, unsigned, unsigned, enumLabel));
 
-                boolean applied;
-                if ("HB_P_PUSHSTRSHORT".equals(enumLabel)) {
-                    applied = applyPushStrShortAt(addr);
-                } else if ("HB_P_LOCALNEARSETSTR".equals(enumLabel)) {
-                    applied = applyLocalNearSetStrAt(addr);
-                } else {
-                    applied = applyTypeAt(addr, enumLabel);
-                }
+                boolean applied = switch (enumLabel) {
+                    case "HB_P_PUSHSTRSHORT" -> applyPushStrShortAt(addr);
+                    case "HB_P_LOCALNEARSETSTR" -> applyLocalNearSetStrAt(addr);
+                    case "HB_P_PUSHBLOCK" -> applyPushBlockAt(addr);
+                    default -> applyTypeAt(addr, enumLabel);
+                };
 
                 if (!applied) {
                     printerr("Could not apply data type '%s' at %s".formatted(enumLabel, addr));
@@ -145,12 +144,12 @@ public class HarbourDecomp extends GhidraScript {
         try {
             Memory mem = currentProgram.getMemory();
             int strlen = mem.getByte(addr.add(1L)) & 0xff;
-            if (strlen <= 0) {
+            if (strlen == 0) {
                 return true;
             }
 
             Address strAddr = addr.add(2L);
-            return applyFixedLengthStringAt(strlen, strAddr);
+            return applyFixedLengthAt(strlen, strAddr, CharDataType.dataType);
         } catch (MemoryAccessException e) {
             printerr("Failed to read HB_P_PUSHSTRSHORT length at %s: %s".formatted(addr.add(1L), e.getMessage()));
             return false;
@@ -170,12 +169,12 @@ public class HarbourDecomp extends GhidraScript {
             int lenLo = mem.getByte(addr.add(2L)) & 0xff;
             int lenHi = mem.getByte(addr.add(3L)) & 0xff;
             int strlen = lenLo | (lenHi << 8);
-            if (strlen <= 0) {
+            if (strlen == 0) {
                 return true;
             }
 
             Address strAddr = addr.add(4L);
-            return applyFixedLengthStringAt(strlen, strAddr);
+            return applyFixedLengthAt(strlen, strAddr, CharDataType.dataType);
         } catch (MemoryAccessException e) {
             printerr("Failed to read HB_P_LOCALNEARSETSTR length at %s: %s".formatted(addr.add(2L), e.getMessage()));
             return false;
@@ -185,14 +184,37 @@ public class HarbourDecomp extends GhidraScript {
         }
     }
 
-    private boolean applyFixedLengthStringAt(int strlen, Address strAddr) throws CodeUnitInsertionException {
-        Address strEnd = strAddr.add(strlen - 1L);
+    private boolean applyPushBlockAt(Address addr) {
+        if (!applyTypeAt(addr, "HB_P_PUSHBLOCK")) {
+            return false;
+        }
+
+        try {
+            Memory mem = currentProgram.getMemory();
+            int len = mem.getByte(addr.add(1L)) & 0xff;
+            if (len <= 0) {
+                return true;
+            }
+
+            Address dataAddr = addr.add(2L);
+            return applyFixedLengthAt(len, dataAddr, ByteDataType.dataType);
+        } catch (MemoryAccessException e) {
+            printerr("Failed to read HB_P_PUSHBLOCK fields at %s: %s".formatted(addr, e.getMessage()));
+            return false;
+        } catch (Exception e) {
+            printerr("Failed to apply HB_P_PUSHBLOCK data at %s: %s".formatted(addr, e.getMessage()));
+            return false;
+        }
+    }
+
+    private boolean applyFixedLengthAt(int len, Address dataAddr, DataType dt) throws CodeUnitInsertionException {
+        Address dataEnd = dataAddr.add(len - 1L);
 
         Listing listing = currentProgram.getListing();
-        listing.clearCodeUnits(strAddr, strEnd, false);
+        listing.clearCodeUnits(dataAddr, dataEnd, false);
 
-        DataType charArr = new ArrayDataType(CharDataType.dataType, strlen, 1);
-        listing.createData(strAddr, charArr);
+        DataType charArr = new ArrayDataType(dt, len, 1);
+        listing.createData(dataAddr, charArr);
         return true;
     }
 
