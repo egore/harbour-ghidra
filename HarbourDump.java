@@ -149,6 +149,11 @@ public class HarbourDump extends GhidraScript {
                 String strValue1 = "str_len_%d".formatted(strlen1);
                 stack.push(new StackItem("string", strValue1, enumLabel));
                 return cur.add(4 + strlen1);
+            case "HB_P_PUSHLOCALNEARINC": {
+                int symbolId = mem.getByte(cur.add(1)) & 0xff;
+                println("  ++%d".formatted(symbolId));
+                return cur.add(dt.getLength());
+            }
             case "HB_P_PUSHNIL":
                 stack.push(new StackItem("nil", "nil", enumLabel));
                 return cur.add(dt.getLength());
