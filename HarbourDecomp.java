@@ -41,7 +41,9 @@ import java.util.ArrayList;
 
 public class HarbourDecomp extends GhidraScript {
 
-    public void run() throws Exception {
+    private final boolean runUntilNextLabel = true;
+
+    public void run() {
         if (currentProgram == null) {
             printerr("No active program.");
             return;
@@ -54,13 +56,36 @@ public class HarbourDecomp extends GhidraScript {
         }
 
         Memory mem = currentProgram.getMemory();
-        try {
-            byte b = mem.getByte(addr);
-            int unsigned = b & 0xff;
+        int iterations = 0;
+        int maxIterations = 10000;
 
-            String enumLabel = resolveHbPcodeLabel(unsigned);
-            if (enumLabel != null) {
-                println("Byte at %s: 0x%02X (%d) => HB_PCODE.%s".formatted(addr, unsigned, unsigned, enumLabel));
+        while (true) {
+            if (monitor.isCancelled()) {
+                return;
+            }
+            if (iterations++ > maxIterations) {
+                printerr("Aborting after %d iterations (last address: %s)".formatted(maxIterations, addr));
+                return;
+            }
+            if (runUntilNextLabel && iterations > 1 && hasLabelAt(addr)) {
+                goTo(addr);
+                currentAddress = addr;
+                return;
+            }
+
+            try {
+                byte b = mem.getByte(addr);
+                int unsigned = b & 0xff;
+
+                String enumLabel = resolveHbPcodeLabel(unsigned);
+                if (enumLabel == null) {
+                    printerr("Byte at %s: 0x%02X (%d) => HB_PCODE.<unknown>".formatted(addr, unsigned, unsigned));
+                    return;
+                }
+
+                if (!runUntilNextLabel) {
+                    println("Byte at %s: 0x%02X (%d) => HB_PCODE.%s".formatted(addr, unsigned, unsigned, enumLabel));
+                }
 
                 int typedLen = switch (enumLabel) {
                     case "HB_P_PUSHSTRSHORT" -> applyPushStrShortAt(addr);
@@ -69,19 +94,33 @@ public class HarbourDecomp extends GhidraScript {
                     default -> applyTypeAt(addr, enumLabel);
                 };
 
+                if ("HB_P_IVARREF".equals(enumLabel)) {
+                    printerr("The next byte possibly needs to be consumed, if hb_stackGetActionRequest() != HB_BREAK_REQUESTED");
+                    return;
+                }
+
                 if (typedLen == Integer.MIN_VALUE) {
                     printerr("Could not apply data type '%s' at %s".formatted(enumLabel, addr));
-                } else {
-                    Address next = addr.add((long) typedLen);
-                    goTo(next);
-                    currentAddress = next;
+                    return;
                 }
-            } else {
-                printerr("Byte at %s: 0x%02X (%d) => HB_PCODE.<unknown>".formatted(addr, unsigned, unsigned));
+
+                Address next = addr.add(typedLen);
+                goTo(next);
+                currentAddress = next;
+                addr = next;
+
+                if (!runUntilNextLabel) {
+                    return;
+                }
+            } catch (MemoryAccessException e) {
+                printerr("Unable to read memory at %s: %s".formatted(addr, e.getMessage()));
+                return;
             }
-        } catch (MemoryAccessException e) {
-            printerr("Unable to read memory at %s: %s".formatted(addr, e.getMessage()));
         }
+    }
+
+    private boolean hasLabelAt(Address addr) {
+        return currentProgram.getSymbolTable().getPrimarySymbol(addr) != null;
     }
 
     private String resolveHbPcodeLabel(int unsignedByte) {
