@@ -33,10 +33,15 @@ import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.DataIterator;
 import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.listing.Listing;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.scalar.Scalar;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolTable;
 import ghidra.program.model.symbol.SourceType;
 
 import java.nio.charset.StandardCharsets;
@@ -74,6 +79,8 @@ public class HarbourSymbFunctions extends GhidraScript {
         long symbElementsUsed = 0;
         long created = 0;
         long renamed = 0;
+        long bytecodeLabelCreated = 0;
+        long bytecodeLabelRenamed = 0;
 
         DataIterator it = listing.getDefinedData(true);
         while (it.hasNext() && !monitor.isCancelled()) {
@@ -93,6 +100,8 @@ public class HarbourSymbFunctions extends GhidraScript {
                 symbElementsUsed += delta[0];
                 created += delta[1];
                 renamed += delta[2];
+                bytecodeLabelCreated += delta[3];
+                bytecodeLabelRenamed += delta[4];
                 continue;
             }
 
@@ -111,6 +120,8 @@ public class HarbourSymbFunctions extends GhidraScript {
                     symbElementsUsed += delta[0];
                     created += delta[1];
                     renamed += delta[2];
+                    bytecodeLabelCreated += delta[3];
+                    bytecodeLabelRenamed += delta[4];
                 }
             }
         }
@@ -119,6 +130,8 @@ public class HarbourSymbFunctions extends GhidraScript {
         println("HB_SYMB elements used (valid szName+value): %d".formatted(symbElementsUsed));
         println("Created functions: %d".formatted(created));
         println("Renamed functions: %d".formatted(renamed));
+        println("Created bytecode labels: %d".formatted(bytecodeLabelCreated));
+        println("Renamed bytecode labels: %d".formatted(bytecodeLabelRenamed));
     }
 
     private long[] processSymbElement(Memory mem, Data symb) {
@@ -126,28 +139,30 @@ public class HarbourSymbFunctions extends GhidraScript {
         Address szNamePtr = readStructPointerField(symb, "szName");
         Address valuePtr = readStructPointerField(symb, "value");
         if (szNamePtr == null || valuePtr == null) {
-            return new long[]{0, 0, 0};
+            return new long[]{0, 0, 0, 0, 0};
         }
 
         String name = readCString(mem, szNamePtr, MAX_NAME_LEN);
         if (name == null) {
-            return new long[]{0, 0, 0};
+            return new long[]{0, 0, 0, 0, 0};
         }
 
         String cleaned = stripQuotes(name);
         if (cleaned == null || cleaned.isBlank()) {
-            return new long[]{0, 0, 0};
+            return new long[]{0, 0, 0, 0, 0};
         }
 
         MemoryBlock valueBlock = mem.getBlock(valuePtr);
         if (valueBlock == null || !valueBlock.isExecute()) {
-            return new long[]{0, 0, 0};
+            return new long[]{0, 0, 0, 0, 0};
         }
 
-        // returns {used, created, renamed}
+        // returns {used, created, renamed, bytecodeLabelCreated, bytecodeLabelRenamed}
         long used = 1;
         long created = 0;
         long renamed = 0;
+        long bytecodeLabelCreated = 0;
+        long bytecodeLabelRenamed = 0;
 
         Function f = getFunctionAt(valuePtr);
         if (f == null) {
@@ -160,7 +175,7 @@ public class HarbourSymbFunctions extends GhidraScript {
                 }
             } catch (Exception e) {
                 printerr("Failed to create function at %s (%s): %s".formatted(valuePtr, cleaned, e.getMessage()));
-                return new long[]{used, created, renamed};
+                return new long[]{used, created, renamed, bytecodeLabelCreated, bytecodeLabelRenamed};
             }
         }
 
@@ -175,9 +190,18 @@ public class HarbourSymbFunctions extends GhidraScript {
                     printerr("Failed to rename function at %s from %s to %s: %s".formatted(valuePtr, existing, cleaned, e.getMessage()));
                 }
             }
+
+            // If the first call is hb_vmExecute(arg0,...), ensure arg0 has a label <FunctionName>_bytecode
+            try {
+                long[] bytecodeChanges = ensureHbVmExecuteBytecodeLabel(f);
+                bytecodeLabelCreated += bytecodeChanges[0];
+                bytecodeLabelRenamed += bytecodeChanges[1];
+            } catch (Exception e) {
+                printerr("Failed to apply hb_vmExecute bytecode label rule for %s: %s".formatted(f.getEntryPoint(), e.getMessage()));
+            }
         }
 
-        return new long[]{used, created, renamed};
+        return new long[]{used, created, renamed, bytecodeLabelCreated, bytecodeLabelRenamed};
     }
 
     private Address readStructPointerField(Data structData, String fieldName) {
@@ -292,5 +316,185 @@ public class HarbourSymbFunctions extends GhidraScript {
         } catch (Exception ignored) {
             // Best effort only
         }
+    }
+
+    private long[] ensureHbVmExecuteBytecodeLabel(Function f) throws Exception {
+        if (f == null) {
+            return new long[]{0, 0};
+        }
+
+        Instruction firstCall = findFirstCallInstruction(f);
+        if (firstCall == null) {
+            return new long[]{0, 0};
+        }
+
+        Address callTarget = resolveCallTarget(firstCall);
+        if (callTarget == null) {
+            return new long[]{0, 0};
+        }
+        if (!isHbVmExecute(callTarget)) {
+            return new long[]{0, 0};
+        }
+
+        // Harbour hb_vmExecute is typically stdcall/cdecl-like with stack args.
+        // The first parameter (pCode) is the last PUSH before the CALL.
+        Address bytecodeAddr = resolveLastPushedAddress(firstCall, 32);
+        if (bytecodeAddr == null) {
+            return new long[]{0, 0};
+        }
+
+        String desired = f.getName() + "_bytecode";
+        return ensureLabel(bytecodeAddr, desired);
+    }
+
+    private Instruction findFirstCallInstruction(Function f) {
+        Listing listing = currentProgram.getListing();
+        InstructionIterator it = listing.getInstructions(f.getBody(), true);
+        while (it.hasNext() && !monitor.isCancelled()) {
+            Instruction ins = it.next();
+            if (ins == null) {
+                continue;
+            }
+            if (ins.getFlowType() != null && ins.getFlowType().isCall()) {
+                return ins;
+            }
+        }
+        return null;
+    }
+
+    private Address resolveCallTarget(Instruction callIns) {
+        if (callIns == null) {
+            return null;
+        }
+        Address[] flows = callIns.getFlows();
+        if (flows != null && flows.length == 1 && flows[0] != null) {
+            return flows[0];
+        }
+        return null;
+    }
+
+    private boolean isHbVmExecute(Address target) {
+        if (target == null) {
+            return false;
+        }
+        Function callee = getFunctionAt(target);
+        if (callee != null) {
+            return "hb_vmExecute".equals(callee.getName());
+        }
+        Symbol s = currentProgram.getSymbolTable().getPrimarySymbol(target);
+        return s != null && "hb_vmExecute".equals(s.getName());
+    }
+
+    private Address resolveLastPushedAddress(Instruction callIns, int maxBack) {
+        Instruction cur = callIns != null ? callIns.getPrevious() : null;
+        int steps = 0;
+        while (cur != null && steps++ < maxBack && !monitor.isCancelled()) {
+            String mnem = cur.getMnemonicString();
+            if (mnem != null && mnem.equalsIgnoreCase("PUSH")) {
+                Address direct = resolvePushOperandToAddress(cur);
+                if (direct != null) {
+                    return direct;
+                }
+            }
+            cur = cur.getPrevious();
+        }
+        return null;
+    }
+
+    private Address resolvePushOperandToAddress(Instruction pushIns) {
+        if (pushIns == null) {
+            return null;
+        }
+        Object[] objs = pushIns.getOpObjects(0);
+        if (objs == null) {
+            return null;
+        }
+
+        for (Object o : objs) {
+            if (o instanceof Address a) {
+                return a;
+            }
+            if (o instanceof Scalar s) {
+                long v = s.getUnsignedValue();
+                if (v != 0) {
+                    return toAddr(v);
+                }
+            }
+            if (o instanceof Register r) {
+                return resolveRegisterAsAddress(pushIns.getPrevious(), r, 32);
+            }
+        }
+        return null;
+    }
+
+    private Address resolveRegisterAsAddress(Instruction start, Register reg, int maxBack) {
+        Instruction cur = start;
+        int steps = 0;
+        while (cur != null && steps++ < maxBack && !monitor.isCancelled()) {
+            String mnem = cur.getMnemonicString();
+            if (mnem == null) {
+                cur = cur.getPrevious();
+                continue;
+            }
+
+            // Look for: MOV reg, imm/addr  OR  LEA reg, [addr]
+            if (mnem.equalsIgnoreCase("MOV") || mnem.equalsIgnoreCase("LEA")) {
+                Object[] dst = cur.getOpObjects(0);
+                if (dst != null) {
+                    boolean writesReg = false;
+                    for (Object d : dst) {
+                        if (d instanceof Register dr && dr.equals(reg)) {
+                            writesReg = true;
+                            break;
+                        }
+                    }
+                    if (writesReg) {
+                        Object[] src = cur.getOpObjects(1);
+                        if (src != null) {
+                            for (Object s : src) {
+                                if (s instanceof Address a) {
+                                    return a;
+                                }
+                                if (s instanceof Scalar sc) {
+                                    long v = sc.getUnsignedValue();
+                                    if (v != 0) {
+                                        return toAddr(v);
+                                    }
+                                }
+                            }
+                        }
+                        return null;
+                    }
+                }
+            }
+
+            cur = cur.getPrevious();
+        }
+        return null;
+    }
+
+    private long[] ensureLabel(Address addr, String desiredName) throws Exception {
+        if (addr == null || desiredName == null || desiredName.isBlank()) {
+            return new long[]{0, 0};
+        }
+
+        int created = 0;
+        int renamed = 0;
+
+        SymbolTable st = currentProgram.getSymbolTable();
+        Symbol s = st.getPrimarySymbol(addr);
+        if (s == null) {
+            createLabel(addr, desiredName, true);
+            println("Created label at %s (%s)".formatted(addr, desiredName));
+            created++;
+        }
+        if (!desiredName.equals(s.getName())) {
+            String old = s.getName();
+            s.setName(desiredName, SourceType.USER_DEFINED);
+            println("Renamed label at %s from %s to %s".formatted(addr, old, desiredName));
+            renamed++;
+        }
+        return new long[]{created, renamed};
+
     }
 }
