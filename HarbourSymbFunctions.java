@@ -81,6 +81,7 @@ public class HarbourSymbFunctions extends GhidraScript {
         long renamed = 0;
         long bytecodeLabelCreated = 0;
         long bytecodeLabelRenamed = 0;
+        long bytecodeMissingDataType = 0;
 
         DataIterator it = listing.getDefinedData(true);
         while (it.hasNext() && !monitor.isCancelled()) {
@@ -102,6 +103,7 @@ public class HarbourSymbFunctions extends GhidraScript {
                 renamed += delta[2];
                 bytecodeLabelCreated += delta[3];
                 bytecodeLabelRenamed += delta[4];
+                bytecodeMissingDataType += delta[5];
                 continue;
             }
 
@@ -122,6 +124,7 @@ public class HarbourSymbFunctions extends GhidraScript {
                     renamed += delta[2];
                     bytecodeLabelCreated += delta[3];
                     bytecodeLabelRenamed += delta[4];
+                    bytecodeMissingDataType += delta[5];
                 }
             }
         }
@@ -132,6 +135,7 @@ public class HarbourSymbFunctions extends GhidraScript {
         println("Renamed functions: %d".formatted(renamed));
         println("Created bytecode labels: %d".formatted(bytecodeLabelCreated));
         println("Renamed bytecode labels: %d".formatted(bytecodeLabelRenamed));
+        println("Bytecode labels without data type: %d".formatted(bytecodeMissingDataType));
     }
 
     private long[] processSymbElement(Memory mem, Data symb) {
@@ -139,30 +143,31 @@ public class HarbourSymbFunctions extends GhidraScript {
         Address szNamePtr = readStructPointerField(symb, "szName");
         Address valuePtr = readStructPointerField(symb, "value");
         if (szNamePtr == null || valuePtr == null) {
-            return new long[]{0, 0, 0, 0, 0};
+            return new long[]{0, 0, 0, 0, 0, 0};
         }
 
         String name = readCString(mem, szNamePtr, MAX_NAME_LEN);
         if (name == null) {
-            return new long[]{0, 0, 0, 0, 0};
+            return new long[]{0, 0, 0, 0, 0, 0};
         }
 
         String cleaned = stripQuotes(name);
         if (cleaned == null || cleaned.isBlank()) {
-            return new long[]{0, 0, 0, 0, 0};
+            return new long[]{0, 0, 0, 0, 0, 0};
         }
 
         MemoryBlock valueBlock = mem.getBlock(valuePtr);
         if (valueBlock == null || !valueBlock.isExecute()) {
-            return new long[]{0, 0, 0, 0, 0};
+            return new long[]{0, 0, 0, 0, 0, 0};
         }
 
-        // returns {used, created, renamed, bytecodeLabelCreated, bytecodeLabelRenamed}
+        // returns {used, created, renamed, bytecodeLabelCreated, bytecodeLabelRenamed, bytecodeMissingDataType}
         long used = 1;
         long created = 0;
         long renamed = 0;
         long bytecodeLabelCreated = 0;
         long bytecodeLabelRenamed = 0;
+        long bytecodeMissingDataType = 0;
 
         Function f = getFunctionAt(valuePtr);
         if (f == null) {
@@ -175,7 +180,7 @@ public class HarbourSymbFunctions extends GhidraScript {
                 }
             } catch (Exception e) {
                 printerr("Failed to create function at %s (%s): %s".formatted(valuePtr, cleaned, e.getMessage()));
-                return new long[]{used, created, renamed, bytecodeLabelCreated, bytecodeLabelRenamed};
+                return new long[]{used, created, renamed, bytecodeLabelCreated, bytecodeLabelRenamed, bytecodeMissingDataType};
             }
         }
 
@@ -196,12 +201,13 @@ public class HarbourSymbFunctions extends GhidraScript {
                 long[] bytecodeChanges = ensureHbVmExecuteBytecodeLabel(f);
                 bytecodeLabelCreated += bytecodeChanges[0];
                 bytecodeLabelRenamed += bytecodeChanges[1];
+                bytecodeMissingDataType += bytecodeChanges[2];
             } catch (Exception e) {
                 printerr("Failed to apply hb_vmExecute bytecode label rule for %s: %s".formatted(f.getEntryPoint(), e.getMessage()));
             }
         }
 
-        return new long[]{used, created, renamed, bytecodeLabelCreated, bytecodeLabelRenamed};
+        return new long[]{used, created, renamed, bytecodeLabelCreated, bytecodeLabelRenamed, bytecodeMissingDataType};
     }
 
     private Address readStructPointerField(Data structData, String fieldName) {
@@ -320,31 +326,39 @@ public class HarbourSymbFunctions extends GhidraScript {
 
     private long[] ensureHbVmExecuteBytecodeLabel(Function f) throws Exception {
         if (f == null) {
-            return new long[]{0, 0};
+            return new long[]{0, 0, 0};
         }
 
         Instruction firstCall = findFirstCallInstruction(f);
         if (firstCall == null) {
-            return new long[]{0, 0};
+            return new long[]{0, 0, 0};
         }
 
         Address callTarget = resolveCallTarget(firstCall);
         if (callTarget == null) {
-            return new long[]{0, 0};
+            return new long[]{0, 0, 0};
         }
         if (!isHbVmExecute(callTarget)) {
-            return new long[]{0, 0};
+            return new long[]{0, 0, 0};
         }
 
         // Harbour hb_vmExecute is typically stdcall/cdecl-like with stack args.
         // The first parameter (pCode) is the last PUSH before the CALL.
         Address bytecodeAddr = resolveLastPushedAddress(firstCall, 32);
         if (bytecodeAddr == null) {
-            return new long[]{0, 0};
+            return new long[]{0, 0, 0};
+        }
+
+        long missingDataType = 0;
+        Data d = currentProgram.getListing().getDataAt(bytecodeAddr);
+        if (d == null || !d.isDefined()) {
+            missingDataType++;
+            println("Bytecode label at %s has no data type".formatted(bytecodeAddr));
         }
 
         String desired = f.getName() + "_bytecode";
-        return ensureLabel(bytecodeAddr, desired);
+        long[] labelChanges = ensureLabel(bytecodeAddr, desired);
+        return new long[]{labelChanges[0], labelChanges[1], missingDataType};
     }
 
     private Instruction findFirstCallInstruction(Function f) {
@@ -487,8 +501,9 @@ public class HarbourSymbFunctions extends GhidraScript {
             createLabel(addr, desiredName, true);
             println("Created label at %s (%s)".formatted(addr, desiredName));
             created++;
+            s = st.getPrimarySymbol(addr);
         }
-        if (!desiredName.equals(s.getName())) {
+        if (s != null && !desiredName.equals(s.getName())) {
             String old = s.getName();
             s.setName(desiredName, SourceType.USER_DEFINED);
             println("Renamed label at %s from %s to %s".formatted(addr, old, desiredName));
