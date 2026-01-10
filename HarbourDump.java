@@ -26,9 +26,12 @@
 
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.data.Array;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypeManager;
 import ghidra.program.model.data.Enum;
+import ghidra.program.model.listing.Data;
+import ghidra.program.model.listing.Listing;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.symbol.Symbol;
@@ -37,6 +40,7 @@ import ghidra.program.model.symbol.SymbolTable;
 import ghidra.program.model.symbol.SymbolType;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Stack;
@@ -44,8 +48,12 @@ import java.util.Stack;
 public class HarbourDump extends GhidraScript {
 
     private Map<Integer, String> hbPcodeCache;
+    private Map<Integer, String> hbSymbolNames = Collections.emptyMap();
     private boolean headerPrinted;
     private Address entryAddress;
+
+    private static final long MAX_SYMBOL_TABLE_BACKTRACK_BYTES = 0x20000;
+    private static final int MAX_SYMBOL_NAME_BYTES = 512;
 
     private static class IfContext {
         final Address end;
@@ -99,6 +107,7 @@ public class HarbourDump extends GhidraScript {
 
         // Initialize HB_PCODE cache once per script run
         hbPcodeCache = initializeHbPcodeCache();
+        hbSymbolNames = tryBuildSymbolTable(entryAddress);
         headerPrinted = false;
 
         // Initialize stack simulation
@@ -186,7 +195,10 @@ public class HarbourDump extends GhidraScript {
                     StringBuilder sig = new StringBuilder();
                     sig.append("FUNCTION ");
                     sig.append(functionName);
-                    sig.append("( ");
+                    sig.append("(");
+                    if (nParams > 0) {
+                        sig.append(" ");
+                    }
                     for (int i = 1; i <= nParams; i++) {
                         if (i > 1) {
                             sig.append(", ");
@@ -194,7 +206,10 @@ public class HarbourDump extends GhidraScript {
                         sig.append("local_");
                         sig.append(i);
                     }
-                    sig.append(" )");
+                    if (nParams > 0) {
+                        sig.append(" ");
+                    }
+                    sig.append(")");
                     println(sig.toString());
                     headerPrinted = true;
                     indentLevel.value = Math.max(indentLevel.value, 1);
@@ -208,14 +223,17 @@ public class HarbourDump extends GhidraScript {
                 int argc = mem.getByte(cur.add(1)) & 0xff;
                 ArrayList<StackItem> args = new ArrayList<>();
                 for (int i = 0; i < argc; i++) {
-                    args.add(0, stack.isEmpty() ? null : stack.pop());
+                    args.addFirst(stack.isEmpty() ? null : stack.pop());
                 }
                 StackItem self = stack.isEmpty() ? null : stack.pop();
                 StackItem sym = stack.isEmpty() ? null : stack.pop();
                 String callee = sym != null ? sym.expr() : "<unknown>";
                 StringBuilder call = new StringBuilder();
                 call.append(callee);
-                call.append("( ");
+                call.append("(");
+                if (!args.isEmpty()) {
+                    call.append(" ");
+                }
                 for (int i = 0; i < args.size(); i++) {
                     if (i > 0) {
                         call.append(",");
@@ -223,7 +241,10 @@ public class HarbourDump extends GhidraScript {
                     StackItem a = args.get(i);
                     call.append(a != null ? a.expr() : "<unknown>");
                 }
-                call.append(" )");
+                if (!args.isEmpty()) {
+                    call.append(" ");
+                }
+                call.append(")");
 
                 String callExpr = call.toString();
                 stack.push(new StackItem("call", callExpr, enumLabel));
@@ -314,7 +335,9 @@ public class HarbourDump extends GhidraScript {
             }
             case "HB_P_PUSHSYMNEAR":
                 int symbolId = mem.getByte(cur.add(1)) & 0xff;
-                stack.push(new StackItem("symbol", "pSymbol[%d]".formatted(symbolId - 1), enumLabel));
+                int symIndex = symbolId - 1;
+                String symName = hbSymbolNames.get(symIndex + 1);
+                stack.push(new StackItem("symbol", symName != null ? symName : "pSymbol[%d]".formatted(symIndex), enumLabel));
                 return cur.add(2);
             case "HB_P_POP":
                 if (!stack.isEmpty()) {
@@ -359,6 +382,18 @@ public class HarbourDump extends GhidraScript {
                     expr = "%s == %s".formatted(left.expr(), right.expr());
                 } else {
                     expr = "<unknown> == <unknown>";
+                }
+                stack.push(new StackItem("bool", expr, enumLabel));
+                return cur.add(dt.getLength());
+            }
+            case "HB_P_MODULUS": {
+                StackItem right = stack.isEmpty() ? null : stack.pop();
+                StackItem left = stack.isEmpty() ? null : stack.pop();
+                String expr;
+                if (left != null && right != null) {
+                    expr = "%s %% %s".formatted(left.expr(), right.expr());
+                } else {
+                    expr = "<unknown> % <unknown>";
                 }
                 stack.push(new StackItem("bool", expr, enumLabel));
                 return cur.add(dt.getLength());
@@ -534,7 +569,9 @@ public class HarbourDump extends GhidraScript {
                 return cur.add(dt.getLength());
             case "HB_P_SFRAME":
                 int function = mem.getByte(cur.add(1)) & 0xff;
-                println("FUNCTION pSymbol[%d]()".formatted(function - 1));
+                int functionIndex = function - 1;
+                String functionName = hbSymbolNames.get(functionIndex + 1);
+                println("FUNCTION %s()".formatted(functionName != null ? functionName : "pSymbol[%d]".formatted(functionIndex)));
                 headerPrinted = true;
                 indentLevel.value = Math.max(indentLevel.value, 1);
                 stack.push(new StackItem("frame", "sframe", enumLabel));
@@ -544,6 +581,182 @@ public class HarbourDump extends GhidraScript {
                 stack.push(new StackItem("unknown", "0x%02X".formatted(opcode), enumLabel));
                 return cur.add(dt.getLength());
         }
+    }
+
+    private Map<Integer, String> tryBuildSymbolTable(Address start) {
+        if (currentProgram == null || start == null) {
+            return null;
+        }
+
+        ArrayList<Address> candidates = findHbSymbArrayCandidatesByBackwardScan(start);
+        if (candidates.isEmpty()) {
+            return null;
+        }
+
+        Exception lastErr = null;
+        for (Address tableAddr : candidates) {
+            try {
+                Map<Integer, String> out = parseHbSymbArrayAt(tableAddr);
+                if (out != null && !out.isEmpty()) {
+                    return out;
+                }
+            } catch (Exception e) {
+                lastErr = e;
+            }
+        }
+
+        if (lastErr != null) {
+            printerr("Failed to parse any HB_SYMB[] candidate (first at %s): %s".formatted(candidates.getFirst(), lastErr.getMessage()));
+        }
+        return null;
+    }
+
+    private Map<Integer, String> parseHbSymbArrayAt(Address tableAddr) throws MemoryAccessException {
+        if (tableAddr == null || currentProgram == null) {
+            return null;
+        }
+
+        Map<Integer, String> out = new HashMap<>();
+        Memory mem = currentProgram.getMemory();
+        Listing listing = currentProgram.getListing();
+        int ptrSize = currentProgram.getDefaultPointerSize();
+        int entrySize = hbSymbEntrySize(ptrSize);
+
+        int maxEntries = -1;
+        Data tableData = listing.getDefinedDataAt(tableAddr);
+        if (isHbSymbArrayData(tableData)) {
+            DataType dt = tableData.getDataType();
+            if (dt instanceof Array arr) {
+                maxEntries = arr.getNumElements();
+            }
+        }
+        if (maxEntries <= 0) {
+            return null;
+        }
+
+        for (int idx = 0; idx < maxEntries && !monitor.isCancelled(); idx++) {
+            Address cur = tableAddr.add((long) idx * entrySize);
+            if (cur == null) {
+                return null;
+            }
+
+            long namePtr = readPointer(mem, cur, ptrSize);
+            if (namePtr == 0) {
+                continue;
+            }
+
+            Address nameAddr;
+            try {
+                nameAddr = toAddr(namePtr);
+            } catch (Exception e) {
+                continue;
+            }
+            if (nameAddr == null || !mem.contains(nameAddr)) {
+                continue;
+            }
+
+            String name = readCString(mem, nameAddr, MAX_SYMBOL_NAME_BYTES);
+            if (name == null || name.isBlank()) {
+                continue;
+            }
+            out.put(idx, name);
+        }
+
+        return out.isEmpty() ? null : out;
+    }
+
+    private ArrayList<Address> findHbSymbArrayCandidatesByBackwardScan(Address start) {
+        Listing listing = currentProgram.getListing();
+        Address minAddr = currentProgram.getMinAddress();
+        SymbolTable st = currentProgram.getSymbolTable();
+        Memory mem = currentProgram.getMemory();
+        int ptrSize = currentProgram.getDefaultPointerSize();
+
+        ArrayList<Address> hits = new ArrayList<>();
+
+        Address cur = start;
+        long remaining = Math.max(0, HarbourDump.MAX_SYMBOL_TABLE_BACKTRACK_BYTES);
+        while (cur != null && remaining-- > 0 && cur.compareTo(minAddr) >= 0 && !monitor.isCancelled()) {
+            Symbol s = st.getPrimarySymbol(cur);
+            if (s != null && s.getSymbolType() == SymbolType.LABEL) {
+                Data direct = listing.getDefinedDataAt(cur);
+                if (isHbSymbArrayData(direct) && !hits.contains(cur)) {
+                    hits.add(cur);
+                }
+
+                try {
+                    long p = readPointer(mem, cur, ptrSize);
+                    if (p != 0) {
+                        Address pAddr = toAddr(p);
+                        Data pointed = pAddr != null ? listing.getDefinedDataAt(pAddr) : null;
+                        if (isHbSymbArrayData(pointed) && !hits.contains(pAddr)) {
+                            hits.add(pAddr);
+                        }
+                    }
+                } catch (MemoryAccessException ignored) {
+                    // ignore and continue scanning
+                }
+            }
+            cur = cur.subtract(1);
+        }
+        return hits;
+    }
+
+    private static boolean isHbSymbArrayData(Data d) {
+        if (d == null) {
+            return false;
+        }
+        DataType dt = d.getDataType();
+        if (!(dt instanceof Array arr)) {
+            return false;
+        }
+        DataType elem = arr.getDataType();
+        String elemName = elem != null ? elem.getName() : null;
+        return elemName != null && elemName.equals("HB_SYMB");
+    }
+
+    private static int hbSymbEntrySize(int ptrSize) {
+        int off = 0;
+        off += ptrSize; // szName
+        off += 4; // scope
+        off = align(off, ptrSize); // alignment before pointer fields
+        off += ptrSize; // value
+        off += ptrSize; // pDynSym
+        return align(off, ptrSize);
+    }
+
+    private static int align(int v, int a) {
+        if (a <= 1) {
+            return v;
+        }
+        int rem = v % a;
+        return rem == 0 ? v : (v + (a - rem));
+    }
+
+    private static long readPointer(Memory mem, Address at, int ptrSize) throws MemoryAccessException {
+        if (ptrSize == 8) {
+            return mem.getLong(at);
+        }
+        return mem.getInt(at) & 0xffffffffL;
+    }
+
+    private static String readCString(Memory mem, Address at, int maxBytes) throws MemoryAccessException {
+        if (at == null || maxBytes <= 0) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < maxBytes; i++) {
+            int b = mem.getByte(at.add(i)) & 0xff;
+            if (b == 0) {
+                break;
+            }
+            if (b >= 0x20 && b < 0x7f) {
+                sb.append((char) b);
+            } else {
+                sb.append(String.format("\\x%02X", b));
+            }
+        }
+        return sb.toString();
     }
 
     private String decodeBlock(Address start, int len, Memory mem, String indent) throws MemoryAccessException {
