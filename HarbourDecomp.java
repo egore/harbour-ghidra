@@ -90,7 +90,6 @@ public class HarbourDecomp extends GhidraScript {
                 int typedLen = switch (enumLabel) {
                     case "HB_P_PUSHSTRSHORT" -> applyPushStrShortAt(addr);
                     case "HB_P_LOCALNEARSETSTR" -> applyLocalNearSetStrAt(addr);
-                    case "HB_P_PUSHBLOCK" -> applyPushBlockAt(addr);
                     default -> applyTypeAt(addr, enumLabel);
                 };
 
@@ -233,31 +232,6 @@ public class HarbourDecomp extends GhidraScript {
             return Integer.MIN_VALUE;
         } catch (Exception e) {
             printerr("Failed to apply HB_P_LOCALNEARSETSTR string data at %s: %s".formatted(addr, e.getMessage()));
-            return Integer.MIN_VALUE;
-        }
-    }
-
-    private int applyPushBlockAt(Address addr) {
-        int baseLen = applyTypeAt(addr, "HB_P_PUSHBLOCK");
-        if (baseLen == Integer.MIN_VALUE) {
-            return Integer.MIN_VALUE;
-        }
-
-        try {
-            Memory mem = currentProgram.getMemory();
-            int len = mem.getByte(addr.add(1L)) & 0xff;
-            if (len <= 0) {
-                return baseLen;
-            }
-
-            Address dataAddr = addr.add(2L);
-            int typed = applyFixedLengthAt(len, dataAddr, ByteDataType.dataType);
-            return baseLen + typed;
-        } catch (MemoryAccessException e) {
-            printerr("Failed to read HB_P_PUSHBLOCK fields at %s: %s".formatted(addr, e.getMessage()));
-            return Integer.MIN_VALUE;
-        } catch (Exception e) {
-            printerr("Failed to apply HB_P_PUSHBLOCK data at %s: %s".formatted(addr, e.getMessage()));
             return Integer.MIN_VALUE;
         }
     }
