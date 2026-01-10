@@ -295,6 +295,15 @@ public class HarbourDump extends GhidraScript {
                 stack.push(new StackItem("number", "%d".formatted(imm), enumLabel));
                 return cur.add(dt.getLength());
             }
+            case "HB_P_PUSHLONG": {
+                int b0 = mem.getByte(cur.add(1)) & 0xff;
+                int b1 = mem.getByte(cur.add(2)) & 0xff;
+                int b2 = mem.getByte(cur.add(3)) & 0xff;
+                int b3 = mem.getByte(cur.add(4)) & 0xff;
+                int imm = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+                stack.push(new StackItem("number", "%d".formatted(imm), enumLabel));
+                return cur.add(dt.getLength());
+            }
             case "HB_P_PUSHSTRSHORT":
                 int strlen = mem.getByte(cur.add(1)) & 0xff;
                 String strValue = readStringLiteral(mem, cur.add(2), strlen);
@@ -370,6 +379,18 @@ public class HarbourDump extends GhidraScript {
                     expr = "%s >= %s".formatted(left.expr(), right.expr());
                 } else {
                     expr = "<unknown> >= <unknown>";
+                }
+                stack.push(new StackItem("bool", expr, enumLabel));
+                return cur.add(dt.getLength());
+            }
+            case "HB_P_LESSEQUAL": {
+                StackItem right = stack.isEmpty() ? null : stack.pop();
+                StackItem left = stack.isEmpty() ? null : stack.pop();
+                String expr;
+                if (left != null && right != null) {
+                    expr = "%s <= %s".formatted(left.expr(), right.expr());
+                } else {
+                    expr = "<unknown> <= <unknown>";
                 }
                 stack.push(new StackItem("bool", expr, enumLabel));
                 return cur.add(dt.getLength());
@@ -526,6 +547,18 @@ public class HarbourDump extends GhidraScript {
                     expr = "<unknown> - <unknown>";
                 }
                 stack.push(new StackItem("number", expr, enumLabel));
+                return cur.add(dt.getLength());
+            }
+            case "HB_P_PLUS": {
+                StackItem right = stack.isEmpty() ? null : stack.pop();
+                StackItem left = stack.isEmpty() ? null : stack.pop();
+                String expr;
+                if (left != null && right != null) {
+                    expr = "%s + %s".formatted(left.expr(), right.expr());
+                } else {
+                    expr = "<unknown> + <unknown>";
+                }
+                stack.push(new StackItem("expr", expr, enumLabel));
                 return cur.add(dt.getLength());
             }
             case "HB_P_LOCALNEARINC": {
