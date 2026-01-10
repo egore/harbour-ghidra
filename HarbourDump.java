@@ -45,6 +45,7 @@ public class HarbourDump extends GhidraScript {
 
     private Map<Integer, String> hbPcodeCache;
     private boolean headerPrinted;
+    private Address entryAddress;
 
     private static class IfContext {
         final Address end;
@@ -94,6 +95,7 @@ public class HarbourDump extends GhidraScript {
             printerr("No current address (place the cursor in the Listing view and re-run).");
             return;
         }
+        entryAddress = addr;
 
         // Initialize HB_PCODE cache once per script run
         hbPcodeCache = initializeHbPcodeCache();
@@ -158,7 +160,7 @@ public class HarbourDump extends GhidraScript {
         if (level <= 0) {
             return "";
         }
-        return "  ".repeat(level);
+        return "   ".repeat(level);
     }
 
     private Address processOpcode(Address cur, int opcode, String enumLabel, Stack<StackItem> stack, Memory mem, IntRef indentLevel, Stack<IfContext> ifStack) throws MemoryAccessException {
@@ -176,15 +178,15 @@ public class HarbourDump extends GhidraScript {
                 return cur.add(1);
             case "HB_P_FRAME":
                 if (!headerPrinted) {
-                    int nParams = mem.getByte(cur.add(1)) & 0xff;
-                    String functionName = resolveFunctionNameAt(currentAddress);
+                    int nParams = mem.getByte(cur.add(2)) & 0xff;
+                    String functionName = resolveFunctionNameAt(entryAddress);
                     if (functionName.endsWith("_bytecode")) {
                         functionName = functionName.substring(0, functionName.length() - "_bytecode".length());
                     }
                     StringBuilder sig = new StringBuilder();
                     sig.append("FUNCTION ");
                     sig.append(functionName);
-                    sig.append("(");
+                    sig.append("( ");
                     for (int i = 1; i <= nParams; i++) {
                         if (i > 1) {
                             sig.append(", ");
@@ -192,9 +194,10 @@ public class HarbourDump extends GhidraScript {
                         sig.append("local_");
                         sig.append(i);
                     }
-                    sig.append(")");
+                    sig.append(" )");
                     println(sig.toString());
                     headerPrinted = true;
+                    indentLevel.value = Math.max(indentLevel.value, 1);
                 }
                 stack.push(new StackItem("frame", "frame", "HB_P_FRAME"));
                 return cur.add(dt.getLength());
@@ -205,22 +208,22 @@ public class HarbourDump extends GhidraScript {
                 int argc = mem.getByte(cur.add(1)) & 0xff;
                 ArrayList<StackItem> args = new ArrayList<>();
                 for (int i = 0; i < argc; i++) {
-                    args.addFirst(stack.isEmpty() ? null : stack.pop());
+                    args.add(0, stack.isEmpty() ? null : stack.pop());
                 }
                 StackItem self = stack.isEmpty() ? null : stack.pop();
                 StackItem sym = stack.isEmpty() ? null : stack.pop();
                 String callee = sym != null ? sym.expr() : "<unknown>";
                 StringBuilder call = new StringBuilder();
                 call.append(callee);
-                call.append("(");
+                call.append("( ");
                 for (int i = 0; i < args.size(); i++) {
                     if (i > 0) {
-                        call.append(", ");
+                        call.append(",");
                     }
                     StackItem a = args.get(i);
                     call.append(a != null ? a.expr() : "<unknown>");
                 }
-                call.append(")");
+                call.append(" )");
 
                 String callExpr = call.toString();
                 stack.push(new StackItem("call", callExpr, enumLabel));
@@ -246,10 +249,31 @@ public class HarbourDump extends GhidraScript {
                 println(indent(indentLevel.value) + "local_%d := %s".formatted(localId, rhs != null ? rhs.expr() : "<empty>"));
                 return cur.add(dt.getLength());
             }
+            case "HB_P_LOCALNEARADD": {
+                int localId = mem.getByte(cur.add(1)) & 0xff;
+                StackItem rhs = stack.isEmpty() ? null : stack.pop();
+                println(indent(indentLevel.value) + "local_%d += %s".formatted(localId, rhs != null ? rhs.expr() : "<empty>"));
+                return cur.add(dt.getLength());
+            }
             case "HB_P_PUSHSTATIC":
                 int staticRef = mem.getByte(cur.add(1)) & 0xff;
                 stack.push(new StackItem("static", "var_%d".formatted(staticRef), enumLabel));
                 return cur.add(dt.getLength());
+            case "HB_P_PUSHBYTE": {
+                int v = mem.getByte(cur.add(1)) & 0xff;
+                stack.push(new StackItem("number", "%d".formatted(v), enumLabel));
+                return cur.add(dt.getLength());
+            }
+            case "HB_P_ONE":
+                stack.push(new StackItem("number", "1", enumLabel));
+                return cur.add(dt.getLength());
+            case "HB_P_PUSHINT": {
+                int lo = mem.getByte(cur.add(1)) & 0xff;
+                int hi = mem.getByte(cur.add(2)) & 0xff;
+                int imm = (short) (lo | (hi << 8));
+                stack.push(new StackItem("number", "%d".formatted(imm), enumLabel));
+                return cur.add(dt.getLength());
+            }
             case "HB_P_PUSHSTRSHORT":
                 int strlen = mem.getByte(cur.add(1)) & 0xff;
                 String strValue = readStringLiteral(mem, cur.add(2), strlen);
@@ -315,6 +339,18 @@ public class HarbourDump extends GhidraScript {
                 stack.push(new StackItem("bool", expr, enumLabel));
                 return cur.add(dt.getLength());
             }
+            case "HB_P_GREATEREQUAL": {
+                StackItem right = stack.isEmpty() ? null : stack.pop();
+                StackItem left = stack.isEmpty() ? null : stack.pop();
+                String expr;
+                if (left != null && right != null) {
+                    expr = "%s >= %s".formatted(left.expr(), right.expr());
+                } else {
+                    expr = "<unknown> >= <unknown>";
+                }
+                stack.push(new StackItem("bool", expr, enumLabel));
+                return cur.add(dt.getLength());
+            }
             case "HB_P_EXACTLYEQUAL": {
                 StackItem right = stack.isEmpty() ? null : stack.pop();
                 StackItem left = stack.isEmpty() ? null : stack.pop();
@@ -360,6 +396,17 @@ public class HarbourDump extends GhidraScript {
                 indentLevel.value++;
                 return cur.add(dt.getLength());
             }
+            case "HB_P_JUMPFALSE": {
+                int lo = mem.getByte(cur.add(1)) & 0xff;
+                int hi = mem.getByte(cur.add(2)) & 0xff;
+                int rel = (short) (lo | (hi << 8));
+                StackItem cond = stack.isEmpty() ? null : stack.pop();
+                println(indent(indentLevel.value) + "IF %s".formatted(cond != null ? cond.expr() : "<empty>"));
+                Address end = cur.add(dt.getLength() + rel);
+                ifStack.push(new IfContext(end));
+                indentLevel.value++;
+                return cur.add(dt.getLength());
+            }
             case "HB_P_JUMPTRUENEAR": {
                 int rel = mem.getByte(cur.add(1));
                 StackItem cond = stack.isEmpty() ? null : stack.pop();
@@ -371,6 +418,9 @@ public class HarbourDump extends GhidraScript {
                 int rel = mem.getByte(cur.add(1));
                 Address dest = cur.add(dt.getLength() + rel);
                 println(indent(indentLevel.value) + "JUMP -> %s".formatted(dest));
+                if (rel > 0) {
+                    return dest;
+                }
                 return cur.add(dt.getLength());
             }
             case "HB_P_LOCALNEARSETINT": {
@@ -403,6 +453,42 @@ public class HarbourDump extends GhidraScript {
                     expr = "%s + %d".formatted(left.expr(), imm);
                 } else {
                     expr = "<unknown> + %d".formatted(imm);
+                }
+                stack.push(new StackItem("number", expr, enumLabel));
+                return cur.add(dt.getLength());
+            }
+            case "HB_P_MULT": {
+                StackItem right = stack.isEmpty() ? null : stack.pop();
+                StackItem left = stack.isEmpty() ? null : stack.pop();
+                String expr;
+                if (left != null && right != null) {
+                    expr = "%s * %s".formatted(left.expr(), right.expr());
+                } else {
+                    expr = "<unknown> * <unknown>";
+                }
+                stack.push(new StackItem("number", expr, enumLabel));
+                return cur.add(dt.getLength());
+            }
+            case "HB_P_DIVIDE": {
+                StackItem right = stack.isEmpty() ? null : stack.pop();
+                StackItem left = stack.isEmpty() ? null : stack.pop();
+                String expr;
+                if (left != null && right != null) {
+                    expr = "%s / %s".formatted(left.expr(), right.expr());
+                } else {
+                    expr = "<unknown> / <unknown>";
+                }
+                stack.push(new StackItem("number", expr, enumLabel));
+                return cur.add(dt.getLength());
+            }
+            case "HB_P_MINUS": {
+                StackItem right = stack.isEmpty() ? null : stack.pop();
+                StackItem left = stack.isEmpty() ? null : stack.pop();
+                String expr;
+                if (left != null && right != null) {
+                    expr = "%s - %s".formatted(left.expr(), right.expr());
+                } else {
+                    expr = "<unknown> - <unknown>";
                 }
                 stack.push(new StackItem("number", expr, enumLabel));
                 return cur.add(dt.getLength());
@@ -449,6 +535,8 @@ public class HarbourDump extends GhidraScript {
             case "HB_P_SFRAME":
                 int function = mem.getByte(cur.add(1)) & 0xff;
                 println("FUNCTION pSymbol[%d]()".formatted(function - 1));
+                headerPrinted = true;
+                indentLevel.value = Math.max(indentLevel.value, 1);
                 stack.push(new StackItem("frame", "sframe", enumLabel));
                 return cur.add(dt.getLength());
             default:
